@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web漏洞扫描器</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Web漏洞扫描器</h1>
+            <p class="subtitle">输入目标URL，自动检测OWASP Top 10基础漏洞</p>
+        </header>
+
+        <div class="scan-box">
+            <div class="input-group">
+                <input type="text" id="targetUrl" placeholder="请输入目标URL，例如: http://example.com" />
+                <button id="scanBtn" onclick="startScan()">开始扫描</button>
+            </div>
+            <p class="disclaimer">仅用于授权的安全测试，请勿用于非法用途</p>
+        </div>
+
+        <div id="progress" class="progress hidden">
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <p id="progressText">正在扫描...</p>
+        </div>
+
+        <div id="summary" class="summary hidden">
+            <h2>扫描结果概览</h2>
+            <div class="summary-cards">
+                <div class="card card-high">
+                    <span class="card-count" id="countHigh">0</span>
+                    <span class="card-label">高危</span>
+                </div>
+                <div class="card card-medium">
+                    <span class="card-count" id="countMedium">0</span>
+                    <span class="card-label">中危</span>
+                </div>
+                <div class="card card-low">
+                    <span class="card-count" id="countLow">0</span>
+                    <span class="card-label">低危</span>
+                </div>
+                <div class="card card-pass">
+                    <span class="card-count" id="countPass">0</span>
+                    <span class="card-label">通过</span>
+                </div>
+            </div>
+        </div>
+
+        <div id="results" class="results hidden">
+            <h2>详细扫描结果</h2>
+            <div id="resultsContainer"></div>
+        </div>
+    </div>
+
+    <script>
+        const SCAN_MODULES = [
+            "信息收集", "安全响应头", "SQL注入",
+            "XSS跨站脚本", "目录遍历与敏感文件", "开放重定向", "CORS配置"
+        ];
+
+        async function startScan() {
+            const url = document.getElementById("targetUrl").value.trim();
+            if (!url) {
+                alert("请输入目标URL");
+                return;
+            }
+
+            const btn = document.getElementById("scanBtn");
+            btn.disabled = true;
+            btn.textContent = "扫描中...";
+
+            document.getElementById("progress").classList.remove("hidden");
+            document.getElementById("summary").classList.add("hidden");
+            document.getElementById("results").classList.add("hidden");
+            document.getElementById("resultsContainer").innerHTML = "";
+
+            // Animate progress
+            let progress = 0;
+            const progressFill = document.getElementById("progressFill");
+            const progressText = document.getElementById("progressText");
+            const interval = setInterval(() => {
+                progress = Math.min(progress + Math.random() * 8, 90);
+                progressFill.style.width = progress + "%";
+                const moduleIdx = Math.min(Math.floor(progress / 13), SCAN_MODULES.length - 1);
+                progressText.textContent = `正在扫描: ${SCAN_MODULES[moduleIdx]}...`;
+            }, 300);
+
+            try {
+                const resp = await fetch("/api/scan", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({url: url}),
+                });
+                const data = await resp.json();
+
+                clearInterval(interval);
+                progressFill.style.width = "100%";
+                progressText.textContent = "扫描完成!";
+
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+
+                displayResults(data);
+            } catch (e) {
+                clearInterval(interval);
+                progressText.textContent = "扫描失败: " + e.message;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "开始扫描";
+            }
+        }
+
+        function displayResults(data) {
+            const summary = data.summary;
+
+            // Count pass results
+            let passCount = 0;
+            for (const [module, items] of Object.entries(data.results)) {
+                for (const item of items) {
+                    if (item.type === "pass") passCount++;
+                }
+            }
+
+            document.getElementById("countHigh").textContent = summary.high;
+            document.getElementById("countMedium").textContent = summary.medium;
+            document.getElementById("countLow").textContent = summary.low;
+            document.getElementById("countPass").textContent = passCount;
+            document.getElementById("summary").classList.remove("hidden");
+
+            const container = document.getElementById("resultsContainer");
+            container.innerHTML = "";
+
+            for (const [module, items] of Object.entries(data.results)) {
+                const section = document.createElement("div");
+                section.className = "result-section";
+
+                const header = document.createElement("div");
+                header.className = "section-header";
+                header.onclick = () => section.classList.toggle("collapsed");
+
+                const vulnCount = items.filter(i => i.type === "high" || i.type === "medium" || i.type === "low").length;
+                const badge = vulnCount > 0
+                    ? `<span class="badge badge-warn">${vulnCount} 个问题</span>`
+                    : `<span class="badge badge-ok">通过</span>`;
+
+                header.innerHTML = `<h3>${module}</h3>${badge}`;
+                section.appendChild(header);
+
+                const body = document.createElement("div");
+                body.className = "section-body";
+
+                for (const item of items) {
+                    const itemDiv = document.createElement("div");
+                    itemDiv.className = "result-item result-" + item.type;
+
+                    const severityMap = {
+                        high: "高危", medium: "中危", low: "低危",
+                        pass: "通过", info: "信息", error: "错误"
+                    };
+
+                    itemDiv.innerHTML = `
+                        <div class="result-header">
+                            <span class="severity severity-${item.type}">${severityMap[item.type] || item.type}</span>
+                            <span class="result-title">${escapeHtml(item.title)}</span>
+                        </div>
+                        <pre class="result-detail">${escapeHtml(item.detail)}</pre>
+                    `;
+                    body.appendChild(itemDiv);
+                }
+
+                section.appendChild(body);
+                container.appendChild(section);
+            }
+
+            document.getElementById("results").classList.remove("hidden");
+
+            // Auto-collapse pass-only sections
+            document.querySelectorAll(".result-section").forEach(sec => {
+                const badge = sec.querySelector(".badge-ok");
+                if (badge) sec.classList.add("collapsed");
+            });
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement("div");
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Enter key to scan
+        document.getElementById("targetUrl").addEventListener("keydown", (e) => {
+            if (e.key === "Enter") startScan();
+        });
+    </script>
+</body>
+</html>
