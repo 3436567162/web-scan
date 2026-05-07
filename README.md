@@ -16,7 +16,7 @@
 
 ## 截图
 
-<img width="1901" height="617" alt="image" src="https://github.com/user-attachments/assets/d75b1700-8136-4ce3-a092-78267f7a8efe" />
+![扫描结果](screenshots/result.png)
 
 ## 快速开始
 

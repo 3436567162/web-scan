@@ -102,7 +102,7 @@ class AppSecurityTests(unittest.TestCase):
             app_module,
             "SCAN_MODULES",
             [("sentinel", lambda _url: [])],
-        ), patch("app.time.monotonic", side_effect=[100.0, 101.0]):
+        ), patch("app.time.monotonic", side_effect=[99.0, 100.0, 101.0, 102.0, 103.0]):
             first = self.client.post(
                 "/api/scan",
                 json={"url": "example.com"},

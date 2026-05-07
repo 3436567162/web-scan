@@ -1,6 +1,8 @@
 """Directory traversal and sensitive file detection."""
 
+import re
 from urllib.parse import urlparse
+
 from .crawler import fetch
 
 
@@ -9,41 +11,41 @@ def _path_rule(path, description, severity):
 
 
 SENSITIVE_PATHS = [
-    _path_rule("/robots.txt", "robots.txt 文件", "info"),
-    _path_rule("/.git/config", "Git配置文件泄露", "high"),
-    _path_rule("/.git/HEAD", "Git仓库泄露", "high"),
-    _path_rule("/.env", "环境配置文件泄露", "high"),
-    _path_rule("/.htaccess", "Apache配置文件泄露", "high"),
-    _path_rule("/web.config", "IIS配置文件泄露", "high"),
-    _path_rule("/phpinfo.php", "PHP信息页面", "medium"),
-    _path_rule("/info.php", "PHP信息页面", "medium"),
-    _path_rule("/server-status", "Apache状态页面", "medium"),
-    _path_rule("/server-info", "Apache信息页面", "medium"),
-    _path_rule("/.DS_Store", "macOS目录文件泄露", "high"),
-    _path_rule("/backup.sql", "数据库备份文件", "high"),
-    _path_rule("/backup.zip", "备份压缩包", "high"),
-    _path_rule("/db.sql", "数据库备份文件", "high"),
-    _path_rule("/dump.sql", "数据库导出文件", "high"),
-    _path_rule("/wp-config.php.bak", "WordPress配置备份", "high"),
-    _path_rule("/config.php.bak", "PHP配置备份", "high"),
-    _path_rule("/.svn/entries", "SVN仓库泄露", "high"),
-    _path_rule("/.hg/dirstate", "Mercurial仓库泄露", "high"),
-    _path_rule("/crossdomain.xml", "跨域策略文件", "low"),
-    _path_rule("/sitemap.xml", "站点地图", "info"),
-    _path_rule("/.well-known/security.txt", "安全联系信息", "info"),
-    _path_rule("/admin/", "管理后台目录", "medium"),
-    _path_rule("/wp-admin/", "WordPress管理后台", "medium"),
-    _path_rule("/api/", "API端点", "medium"),
-    _path_rule("/debug/", "调试页面", "medium"),
-    _path_rule("/test/", "测试页面", "medium"),
-    _path_rule("/console", "控制台页面", "medium"),
+    _path_rule("/robots.txt", "robots.txt file", "info"),
+    _path_rule("/.git/config", "Git config disclosure", "high"),
+    _path_rule("/.git/HEAD", "Git repository disclosure", "high"),
+    _path_rule("/.env", "Environment file disclosure", "high"),
+    _path_rule("/.htaccess", "Apache config disclosure", "high"),
+    _path_rule("/web.config", "IIS config disclosure", "high"),
+    _path_rule("/phpinfo.php", "PHP info page", "medium"),
+    _path_rule("/info.php", "PHP info page", "medium"),
+    _path_rule("/server-status", "Apache server-status page", "medium"),
+    _path_rule("/server-info", "Apache server-info page", "medium"),
+    _path_rule("/.DS_Store", "macOS metadata disclosure", "high"),
+    _path_rule("/backup.sql", "Database backup file", "high"),
+    _path_rule("/backup.zip", "Backup archive", "high"),
+    _path_rule("/db.sql", "Database backup file", "high"),
+    _path_rule("/dump.sql", "Database dump file", "high"),
+    _path_rule("/wp-config.php.bak", "WordPress config backup", "high"),
+    _path_rule("/config.php.bak", "PHP config backup", "high"),
+    _path_rule("/.svn/entries", "SVN repository disclosure", "high"),
+    _path_rule("/.hg/dirstate", "Mercurial repository disclosure", "high"),
+    _path_rule("/crossdomain.xml", "Cross-domain policy file", "low"),
+    _path_rule("/sitemap.xml", "Sitemap", "info"),
+    _path_rule("/.well-known/security.txt", "Security contact file", "info"),
+    _path_rule("/admin/", "Admin directory", "medium"),
+    _path_rule("/wp-admin/", "WordPress admin directory", "medium"),
+    _path_rule("/api/", "API endpoint", "medium"),
+    _path_rule("/debug/", "Debug page", "medium"),
+    _path_rule("/test/", "Test page", "medium"),
+    _path_rule("/console", "Console page", "medium"),
 ]
 
 TRAVERSAL_PAYLOADS = [
-    ("../../../etc/passwd", "Linux密码文件", "root:"),
-    ("..\\..\\..\\windows\\win.ini", "Windows配置文件", "[fonts]"),
-    ("....//....//....//etc/passwd", "双写绕过", "root:"),
-    ("%2e%2e/%2e%2e/%2e%2e/etc/passwd", "URL编码绕过", "root:"),
+    ("../../../etc/passwd", "Linux password file", "root:"),
+    ("..\\..\\..\\windows\\win.ini", "Windows config file", "[fonts]"),
+    ("....//....//....//etc/passwd", "double-encoding bypass", "root:"),
+    ("%2e%2e/%2e%2e/%2e%2e/etc/passwd", "URL-encoded bypass", "root:"),
 ]
 
 DIRECTORY_LISTING_MARKERS = [
@@ -52,6 +54,11 @@ DIRECTORY_LISTING_MARKERS = [
     "<title>directory listing",
     "parent directory",
 ]
+
+HTML_MARKERS = ("<html", "<!doctype html", "<body", "<head", "<title")
+ENV_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+$", re.MULTILINE)
+ZIP_MARKERS = ("PK\x03\x04", "PK\x05\x06", "PK\x07\x08")
+DS_STORE_MARKERS = ("Bud1", "DSDB")
 
 
 def check_dir_traversal(url):
@@ -79,12 +86,14 @@ def _check_sensitive_files(base):
         if resp is None:
             continue
 
-        if resp.status_code == 200 and len(resp.text) > 10:
-            # Verify it's not a generic error page
-            if _is_valid_content(resp.text, path):
+        body = resp.text or ""
+        if resp.status_code == 200 and len(body) > 10:
+            evidence = _build_sensitive_file_evidence(body, path)
+            if evidence:
                 found.append({
                     "severity": rule["severity"],
                     "detail": f"{rule['description']}: {test_url}",
+                    "evidence": evidence,
                 })
 
         import time
@@ -94,14 +103,15 @@ def _check_sensitive_files(base):
         for item in found:
             results.append({
                 "type": item["severity"],
-                "title": "敏感文件/路径暴露",
+                "title": "Sensitive file/path exposure",
                 "detail": item["detail"],
+                "evidence": item["evidence"],
             })
     else:
         results.append({
             "type": "pass",
-            "title": "敏感文件扫描通过",
-            "detail": "未发现常见敏感文件暴露",
+            "title": "Sensitive file scan passed",
+            "detail": "No common sensitive files were confirmed.",
         })
 
     return results
@@ -117,13 +127,13 @@ def _check_directory_listing(base):
         if resp is None:
             continue
 
-        resp_lower = resp.text.lower()
+        resp_lower = (resp.text or "").lower()
         for marker in DIRECTORY_LISTING_MARKERS:
             if marker in resp_lower:
                 results.append({
                     "type": "medium",
-                    "title": "目录列表开启",
-                    "detail": f"路径 {base + path} 开启了目录列表功能",
+                    "title": "Directory listing enabled",
+                    "detail": f"Path {base + path} exposes a directory listing",
                 })
                 break
 
@@ -137,8 +147,6 @@ def _check_path_traversal(url):
     """Test for path traversal vulnerabilities."""
     results = []
     parsed = urlparse(url)
-
-    # Find path segments that might be injectable
     path = parsed.path
     if not path or path == "/":
         return results
@@ -147,7 +155,6 @@ def _check_path_traversal(url):
     if len(segments) < 1:
         return results
 
-    # Try injecting into the last path segment
     for payload, desc, marker in TRAVERSAL_PAYLOADS:
         new_path = "/" + "/".join(segments[:-1]) + "/" + payload
         test_url = f"{parsed.scheme}://{parsed.netloc}{new_path}"
@@ -158,11 +165,11 @@ def _check_path_traversal(url):
         if resp is None:
             continue
 
-        if marker in resp.text:
+        if marker in (resp.text or ""):
             results.append({
                 "type": "high",
-                "title": "路径遍历漏洞",
-                "detail": f"在路径中发现目录遍历 ({desc})\n测试URL: {test_url}",
+                "title": "Path traversal vulnerability",
+                "detail": f"Traversal content found in path ({desc})\nTest URL: {test_url}",
             })
             break
 
@@ -172,38 +179,96 @@ def _check_path_traversal(url):
     return results
 
 
-def _is_valid_content(body, path):
-    """Check if the response is real content vs a generic error page."""
+def _looks_like_html(body_lower):
+    return any(marker in body_lower for marker in HTML_MARKERS)
+
+
+def _build_sensitive_file_evidence(body, path):
+    """Return evidence markers when content looks like a real hit."""
     body_lower = body.lower()
 
-    # Common error page indicators
     error_indicators = ["404 not found", "page not found", "error 404", "not found"]
-    for indicator in error_indicators:
-        if indicator in body_lower and len(body) < 2000:
-            return False
+    if any(indicator in body_lower for indicator in error_indicators) and len(body) < 2000:
+        return None
 
-    # Specific checks
+    if path.endswith(("/robots.txt", "/sitemap.xml", "/.well-known/security.txt", "/crossdomain.xml")):
+        return _metadata_evidence(body_lower, path)
+
+    if _looks_like_html(body_lower):
+        return None
+
     if path.endswith(".git/config"):
-        return "[core]" in body or "repositoryformatversion" in body_lower
+        return _marker_evidence(body, ("[core]", "repositoryformatversion"))
     if path.endswith(".git/HEAD"):
-        return "ref:" in body
+        return _marker_evidence(body, ("ref:",))
     if path.endswith(".env"):
-        return "=" in body and len(body) < 10000
+        match = ENV_LINE_RE.search(body)
+        return [f"env_line={match.group(0).strip()}"] if match else None
+    if path.endswith((".sql", "/backup.sql", "/db.sql", "/dump.sql")):
+        return _marker_evidence(body, (
+            "-- MySQL dump",
+            "CREATE TABLE",
+            "INSERT INTO",
+            "DROP TABLE",
+            "LOCK TABLES",
+        ))
+    if path.endswith(".htaccess"):
+        return _marker_evidence(body, ("RewriteEngine", "AuthType", "Deny from", "Require all"))
+    if path.endswith("web.config"):
+        return _marker_evidence(body, ("<configuration", "<appsettings", "<connectionstrings"))
+    if path.endswith(".php.bak"):
+        return _marker_evidence(body, ("<?php", "$", "define("))
+    if path.endswith(".svn/entries"):
+        return _marker_evidence(body, ("svn", "dir", "file"))
+    if path.endswith(".hg/dirstate"):
+        if "\x00" in body and len(body) > 40:
+            return [f"binary_length={len(body)}", "marker=NUL"]
+        return None
+    if path.endswith(".DS_Store"):
+        return _marker_evidence(body, DS_STORE_MARKERS)
+    if path.endswith(".zip"):
+        return _binary_prefix_evidence(body, ZIP_MARKERS)
+    if path.endswith("/phpinfo.php") or path.endswith("/info.php"):
+        return _marker_evidence(body, ("phpinfo()", "PHP Version", "<title>phpinfo"))
+    if path.endswith("/server-status"):
+        return _marker_evidence(body, ("apache server status", "server version", "current time"))
+    if path.endswith("/server-info"):
+        return _marker_evidence(body, ("server information", "apache server information"))
+    if path.endswith(("/admin/", "/wp-admin/", "/api/", "/debug/", "/test/", "/console")):
+        return [f"content_length={len(body)}"] if len(body) > 50 else None
+
+    return [f"content_length={len(body)}"] if len(body) > 50 else None
+
+
+def _metadata_evidence(body_lower, path):
     if path.endswith("/robots.txt"):
-        return "user-agent" in body_lower or "disallow" in body_lower
+        return _marker_evidence(body_lower, ("user-agent", "disallow", "allow"))
     if path.endswith("/sitemap.xml"):
-        return "<urlset" in body_lower or "<sitemapindex" in body_lower
+        return _marker_evidence(body_lower, ("<urlset", "<sitemapindex", "<url>", "<loc>"))
     if path.endswith("/.well-known/security.txt"):
-        security_directives = [
+        return _marker_evidence(body_lower, (
             "contact:",
             "expires:",
             "encryption:",
             "policy:",
             "acknowledgments:",
             "hiring:",
-        ]
-        return any(directive in body_lower for directive in security_directives)
+        ))
     if path.endswith("/crossdomain.xml"):
-        return "<cross-domain-policy" in body_lower
+        return _marker_evidence(body_lower, ("<cross-domain-policy",))
+    return None
 
-    return len(body) > 50
+
+def _marker_evidence(body, markers):
+    body_lower = body.lower()
+    for marker in markers:
+        if marker.lower() in body_lower:
+            return [f"marker={marker}"]
+    return None
+
+
+def _binary_prefix_evidence(body, markers):
+    for marker in markers:
+        if body.startswith(marker):
+            return [f"marker={marker[:2]}"]
+    return None

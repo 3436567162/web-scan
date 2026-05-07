@@ -2,7 +2,8 @@
 
 import re
 import time
-from .crawler import fetch, extract_forms, extract_params, inject_param
+
+from .crawler import extract_forms, extract_params, fetch, inject_param
 
 XSS_PAYLOADS = [
     "<script>alert(1)</script>",
@@ -14,12 +15,25 @@ XSS_PAYLOADS = [
     "<body onload=alert(1)>",
 ]
 
-# Dangerous unencoded HTML/script fragments. Plain text "alert(1)" is
-# intentionally excluded because it does not prove executable reflection.
-DANGEROUS_HTML_PATTERNS = [
-    re.compile(r"<\s*script\b[^>]*>.*?alert\s*\(\s*1\s*\).*?<\s*/\s*script\s*>", re.IGNORECASE | re.DOTALL),
-    re.compile(r"<[^>]+\s+on(?:error|load)\s*=\s*['\"]?alert\s*\(\s*1\s*\)", re.IGNORECASE),
-    re.compile(r"<[^>]+\s+(?:href|src)\s*=\s*['\"]?javascript\s*:\s*alert\s*\(\s*1\s*\)", re.IGNORECASE),
+XSS_RULES = [
+    (
+        "xss.reflected.script-tag",
+        re.compile(
+            r"<\s*script\b[^>]*>.*?alert\s*\(\s*1\s*\).*?<\s*/\s*script\s*>",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ),
+    (
+        "xss.reflected.event-handler",
+        re.compile(r"<[^>]+\s+on(?:error|load)\s*=\s*['\"]?alert\s*\(\s*1\s*\)", re.IGNORECASE),
+    ),
+    (
+        "xss.reflected.javascript-uri",
+        re.compile(
+            r"<[^>]+\s+(?:href|src)\s*=\s*['\"]?javascript\s*:\s*alert\s*\(\s*1\s*\)",
+            re.IGNORECASE,
+        ),
+    ),
 ]
 
 
@@ -47,17 +61,29 @@ def _check_url_params(url):
 
             time.sleep(0.2)
 
-            if _has_unencoded_xss_reflection(resp.text, payload):
-                results.append({
-                    "type": "high",
-                    "title": "XSS跨站脚本漏洞 (GET参数)",
-                    "detail": (
-                        f"参数 '{param_name}' 存在反射型XSS\n"
-                        f"Payload: {payload}\n"
-                        f"Payload被原样返回到页面中"
-                    ),
-                    "url": test_url,
-                })
+            evidence = _extract_xss_evidence(resp.text, payload)
+            if evidence:
+                results.append(
+                    {
+                        "type": "high",
+                        "title": "Reflected XSS (query parameter)",
+                        "detail": (
+                            f"Parameter '{param_name}' reflects executable HTML.\n"
+                            f"Payload: {payload}\n"
+                            f"Matched snippet: {evidence[0]['response_snippet']}"
+                        ),
+                        "url": test_url,
+                        "confidence": "high",
+                        "evidence": evidence,
+                        "remediation": [
+                            "HTML-encode untrusted input before rendering it in HTML.",
+                            "Do not place untrusted input into script blocks, event handlers, or javascript: URLs.",
+                        ],
+                        "category": "injection",
+                        "rule_id": evidence[0]["rule_id"],
+                        "location": f"query.{param_name}",
+                    }
+                )
                 break
 
     return results
@@ -96,28 +122,71 @@ def _check_forms(url):
 
                 time.sleep(0.2)
 
-                if _has_unencoded_xss_reflection(resp.text, payload):
-                    results.append({
-                        "type": "high",
-                        "title": "XSS跨站脚本漏洞 (表单)",
-                        "detail": (
-                            f"表单字段 '{inp['name']}' 存在反射型XSS\n"
-                            f"表单Action: {form['action']}\n"
-                            f"Method: {form['method']}\n"
-                            f"Payload: {payload}"
-                        ),
-                    })
+                evidence = _extract_xss_evidence(resp.text, payload)
+                if evidence:
+                    results.append(
+                        {
+                            "type": "high",
+                            "title": "Reflected XSS (form input)",
+                            "detail": (
+                                f"Form field '{inp['name']}' reflects executable HTML.\n"
+                                f"Action: {form['action']}\n"
+                                f"Method: {form['method']}\n"
+                                f"Payload: {payload}"
+                            ),
+                            "confidence": "high",
+                            "evidence": evidence,
+                            "remediation": [
+                                "HTML-encode untrusted input before rendering it in HTML.",
+                                "Do not place untrusted input into script blocks, event handlers, or javascript: URLs.",
+                            ],
+                            "category": "injection",
+                            "rule_id": evidence[0]["rule_id"],
+                            "location": f"form.{inp['name']}",
+                        }
+                    )
                     break
 
     return results
 
 
 def _has_unencoded_xss_reflection(body, payload):
-    """Return True only for raw payload or executable-looking HTML reflection."""
-    if not body:
-        return False
+    """Return True only for executable or clearly unsafe reflection."""
+    return _match_xss_rule(body, payload) is not None
 
-    if payload in body:
-        return True
 
-    return any(pattern.search(body) for pattern in DANGEROUS_HTML_PATTERNS)
+def _extract_xss_evidence(body, payload):
+    """Return finding evidence for an executable reflection."""
+    match = _match_xss_rule(body, payload)
+    if match is None:
+        return []
+
+    rule_id, matched_text = match
+    return [
+        {
+            "payload": payload,
+            "response_snippet": matched_text,
+            "matched_response_snippet": matched_text,
+            "rule_id": rule_id,
+        }
+    ]
+
+
+def _match_xss_rule(body, payload):
+    """Return the matched rule id and snippet when reflection is executable."""
+    if not body or payload not in body:
+        return None
+
+    comment_matches = list(re.finditer(r"<!--.*?-->", body, flags=re.DOTALL))
+    if any(payload in match.group(0) for match in comment_matches):
+        # Ambiguous reflection: the payload is definitely inert somewhere in the
+        # response, so do not upgrade severity based on another matching pattern.
+        return None
+
+    body_without_comments = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    for rule_id, pattern in XSS_RULES:
+        match = pattern.search(body_without_comments)
+        if match and payload in match.group(0):
+            return rule_id, match.group(0)[:200]
+
+    return None

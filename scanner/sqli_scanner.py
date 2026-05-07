@@ -1,36 +1,30 @@
 """SQL Injection detection based on error-based injection."""
 
+import re
 import time
-from urllib.parse import urlparse, parse_qs, urlencode
 
-from .crawler import fetch, extract_forms, extract_params, inject_param
+from .crawler import extract_forms, extract_params, fetch, inject_param
 
 SQLI_PAYLOADS = ["'", "\"", "' OR '1'='1", "\" OR \"1\"=\"1", "1' AND '1'='1", "1 AND 1=1--"]
 
-SQL_ERROR_PATTERNS = [
-    "you have an error in your sql syntax",
-    "warning: mysql",
-    "unclosed quotation mark",
-    "microsoft ole db provider for odbc drivers",
-    "microsoft ole db provider for sql server",
-    "sqlstate",
-    "pg_query",
-    "pg_exec",
-    "sqlite3",
-    "sql command not properly ended",
-    "quoted string not properly terminated",
-    "mysql_fetch",
-    "mysql_num_rows",
-    "ora-",
-    "postgresql",
-    "syntax error",
-    "sqlite_error",
-    "sqlalchemy",
-    "database error",
-    "db2 sql error",
-    "microsoft access",
-    "jdbc",
-    "odbc",
+SQL_ERROR_RULES = [
+    ("sqli.mysql.syntax", re.compile(r"you have an error in your sql syntax", re.IGNORECASE)),
+    ("sqli.mysql.warning", re.compile(r"warning:\s*mysql", re.IGNORECASE)),
+    ("sqli.mssql.unclosed-quote", re.compile(r"unclosed quotation mark", re.IGNORECASE)),
+    (
+        "sqli.mssql.ole-db",
+        re.compile(r"microsoft ole db provider for (?:odbc drivers|sql server)", re.IGNORECASE),
+    ),
+    ("sqli.sqlstate", re.compile(r"sqlstate(?:\[[^\]]+\])?", re.IGNORECASE)),
+    ("sqli.postgres.pg-query", re.compile(r"\bpg_(?:query|exec)\b", re.IGNORECASE)),
+    ("sqli.sqlite.sqlite3", re.compile(r"\bsqlite3\b", re.IGNORECASE)),
+    ("sqli.oracle.command-ended", re.compile(r"sql command not properly ended", re.IGNORECASE)),
+    ("sqli.oracle.quoted-string", re.compile(r"quoted string not properly terminated", re.IGNORECASE)),
+    ("sqli.mysql.api-call", re.compile(r"\bmysql_(?:fetch|num_rows)\b", re.IGNORECASE)),
+    ("sqli.oracle.ora-code", re.compile(r"\bora-\d{4,}\b", re.IGNORECASE)),
+    ("sqli.postgres.name", re.compile(r"\bpostgresql\b", re.IGNORECASE)),
+    ("sqli.sqlite.sqlite-error", re.compile(r"\bsqlite_error\b", re.IGNORECASE)),
+    ("sqli.db2.error", re.compile(r"\bdb2 sql error\b", re.IGNORECASE)),
 ]
 
 
@@ -52,7 +46,8 @@ def _check_url_params(url):
     original_resp = fetch(url)
     if original_resp is None:
         return results
-    original_text = original_resp.text
+
+    baseline_signals = _find_sql_error_signals(original_resp.text)
 
     for param_name in params:
         for payload in SQLI_PAYLOADS:
@@ -61,26 +56,32 @@ def _check_url_params(url):
             if resp is None:
                 continue
 
-            time.sleep(0.2)  # Rate limiting
+            time.sleep(0.2)
 
-            # Check for SQL errors in response
-            resp_lower = resp.text.lower()
-            for pattern in SQL_ERROR_PATTERNS:
-                if pattern in resp_lower and pattern not in original_text.lower():
-                    results.append({
+            evidence = _build_sqli_evidence(resp.text, payload, baseline_signals)
+            if evidence:
+                results.append(
+                    {
                         "type": "high",
-                        "title": "SQL注入漏洞 (GET参数)",
+                        "title": "SQL injection (query parameter)",
                         "detail": (
-                            f"参数 '{param_name}' 存在SQL注入风险\n"
+                            f"Parameter '{param_name}' introduced a database-specific error.\n"
                             f"Payload: {payload}\n"
-                            f"匹配错误信息: {pattern}"
+                            f"Matched signal: {evidence[0]['matched_text']}"
                         ),
                         "url": test_url,
-                    })
-                    break
-            else:
-                continue
-            break  # Found one payload for this param, move to next
+                        "confidence": "high",
+                        "evidence": evidence,
+                        "remediation": [
+                            "Use parameterized queries for all database access.",
+                            "Do not concatenate untrusted input into SQL statements.",
+                        ],
+                        "category": "injection",
+                        "rule_id": evidence[0]["rule_id"],
+                        "location": f"query.{param_name}",
+                    }
+                )
+                break
 
     return results
 
@@ -97,19 +98,21 @@ def _check_forms(url):
             if inp["type"] in ("submit", "button", "hidden", "file", "checkbox", "radio"):
                 continue
 
-            for payload in SQLI_PAYLOADS:
-                data = {}
-                for field in form["inputs"]:
-                    if field["name"] == inp["name"]:
-                        data[field["name"]] = payload
-                    elif field["type"] not in ("submit", "button"):
-                        data[field["name"]] = field.get("value", "test")
+            baseline_data = _build_form_data(form, inp["name"], "test")
+            try:
+                baseline_resp = _submit_form(form, baseline_data)
+            except Exception:
+                continue
 
+            if baseline_resp is None:
+                continue
+
+            baseline_signals = _find_sql_error_signals(baseline_resp.text)
+
+            for payload in SQLI_PAYLOADS:
+                data = _build_form_data(form, inp["name"], payload)
                 try:
-                    if form["method"] == "POST":
-                        resp = fetch(form["action"], method="POST", data=data)
-                    else:
-                        resp = fetch(form["action"], params=data)
+                    resp = _submit_form(form, data)
                 except Exception:
                     continue
 
@@ -118,23 +121,83 @@ def _check_forms(url):
 
                 time.sleep(0.2)
 
-                resp_lower = resp.text.lower()
-                for pattern in SQL_ERROR_PATTERNS:
-                    if pattern in resp_lower:
-                        results.append({
+                evidence = _build_sqli_evidence(resp.text, payload, baseline_signals)
+                if evidence:
+                    results.append(
+                        {
                             "type": "high",
-                            "title": "SQL注入漏洞 (表单)",
+                            "title": "SQL injection (form input)",
                             "detail": (
-                                f"表单字段 '{inp['name']}' 存在SQL注入风险\n"
-                                f"表单Action: {form['action']}\n"
+                                f"Form field '{inp['name']}' introduced a database-specific error.\n"
+                                f"Action: {form['action']}\n"
                                 f"Method: {form['method']}\n"
                                 f"Payload: {payload}\n"
-                                f"匹配错误信息: {pattern}"
+                                f"Matched signal: {evidence[0]['matched_text']}"
                             ),
-                        })
-                        break
-                else:
-                    continue
-                break
+                            "confidence": "high",
+                            "evidence": evidence,
+                            "remediation": [
+                                "Use parameterized queries for all database access.",
+                                "Do not concatenate untrusted input into SQL statements.",
+                            ],
+                            "category": "injection",
+                            "rule_id": evidence[0]["rule_id"],
+                            "location": f"form.{inp['name']}",
+                        }
+                    )
+                    break
 
     return results
+
+
+def _submit_form(form, data):
+    """Submit a form using its declared method."""
+    if form["method"] == "POST":
+        return fetch(form["action"], method="POST", data=data)
+    return fetch(form["action"], params=data)
+
+
+def _build_form_data(form, target_name, target_value):
+    """Build a form submission payload with one targeted field value."""
+    data = {}
+    for field in form["inputs"]:
+        if field["type"] in ("submit", "button"):
+            continue
+        if field["name"] == target_name:
+            data[field["name"]] = target_value
+        else:
+            data[field["name"]] = field.get("value", "test") or "test"
+    return data
+
+
+def _build_sqli_evidence(body, payload, baseline_signals):
+    """Return evidence only when the injected response adds a stronger DB signal."""
+    response_signals = _find_sql_error_signals(body)
+    baseline_rule_ids = {signal["rule_id"] for signal in baseline_signals}
+
+    for signal in response_signals:
+        if signal["rule_id"] not in baseline_rule_ids:
+            return [
+                {
+                    "payload": payload,
+                    "matched_text": signal["matched_text"],
+                    "response_snippet": signal["matched_text"],
+                    "rule_id": signal["rule_id"],
+                    "baseline_signals": [item["rule_id"] for item in baseline_signals],
+                }
+            ]
+
+    return []
+
+
+def _find_sql_error_signals(text):
+    """Extract strong, database-specific error signals from a response body."""
+    if not text:
+        return []
+
+    signals = []
+    for rule_id, pattern in SQL_ERROR_RULES:
+        match = pattern.search(text)
+        if match:
+            signals.append({"rule_id": rule_id, "matched_text": match.group(0)[:200]})
+    return signals
