@@ -2,13 +2,20 @@
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import ipaddress
+import os
 import time
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 
 import requests
 from bs4 import BeautifulSoup
 
-from .url_safety import validate_public_http_url, validate_redirect_target
+from .url_safety import (
+    is_blocked_ip,
+    resolve_target_ips,
+    validate_public_http_url,
+    validate_redirect_target,
+)
 
 
 HEADERS = {
@@ -17,6 +24,7 @@ HEADERS = {
 }
 TIMEOUT = 10
 MAX_RESPONSE_BYTES = 1024 * 1024
+VERIFY_TLS_ENV = "SCANNER_VERIFY_TLS"
 _REQUEST_BUDGET = ContextVar("scan_request_budget", default=None)
 
 
@@ -80,6 +88,75 @@ def _safe_close(response):
         pass
 
 
+def _parse_bool_env(name, default=True):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_verify_tls():
+    return _parse_bool_env(VERIFY_TLS_ENV, default=True)
+
+
+def _extract_peer_ip(response):
+    raw = getattr(response, "raw", None)
+    if raw is None:
+        return None
+
+    socket_candidates = [
+        getattr(getattr(raw, "_connection", None), "sock", None),
+        getattr(
+            getattr(getattr(getattr(raw, "_fp", None), "fp", None), "raw", None),
+            "_sock",
+            None,
+        ),
+    ]
+
+    for sock in socket_candidates:
+        if sock is None:
+            continue
+
+        try:
+            peer_name = sock.getpeername()
+        except (AttributeError, OSError, TypeError):
+            continue
+
+        if isinstance(peer_name, tuple):
+            peer_name = peer_name[0]
+
+        try:
+            return ipaddress.ip_address(peer_name)
+        except ValueError:
+            continue
+
+    return None
+
+
+def _validate_response_peer(response):
+    peer_ip = _extract_peer_ip(response)
+    if peer_ip is None:
+        return
+    if is_blocked_ip(peer_ip):
+        raise ValueError("Response peer address is not allowed")
+
+    hostname = urlparse(response.url).hostname
+    if not hostname:
+        raise ValueError("Response URL hostname is required")
+
+    expected_ips = resolve_target_ips(hostname)
+    if any(is_blocked_ip(ip) for ip in expected_ips):
+        raise ValueError("Response URL resolved to a blocked address")
+    if peer_ip not in expected_ips:
+        raise ValueError("Response peer address did not match the validated target")
+
+
+def _validate_response_peer_chain(response):
+    history = list(getattr(response, "history", []) or [])
+    for item in history + [response]:
+        _validate_response_peer(item)
+
+
 def _read_bounded_response(response):
     if getattr(response, "raw", None) is None and hasattr(response, "_content"):
         content = getattr(response, "_content", b"") or b""
@@ -130,14 +207,20 @@ def fetch(url, method="GET", headers=None, **kwargs):
         elif hooks is not None:
             request_kwargs["hooks"] = hooks
 
-        if method.upper() == "POST":
+        request_method = method.upper()
+        if request_method == "POST":
             resp = requests.post(url, headers=merged_headers, timeout=TIMEOUT,
-                                 verify=False, allow_redirects=allow_redirects,
+                                 verify=_should_verify_tls(), allow_redirects=allow_redirects,
                                  stream=True, **request_kwargs)
-        else:
+        elif request_method == "GET":
             resp = requests.get(url, headers=merged_headers, timeout=TIMEOUT,
-                                verify=False, allow_redirects=allow_redirects,
+                                verify=_should_verify_tls(), allow_redirects=allow_redirects,
                                 stream=True, **request_kwargs)
+        else:
+            resp = requests.request(request_method, url, headers=merged_headers, timeout=TIMEOUT,
+                                    verify=_should_verify_tls(), allow_redirects=allow_redirects,
+                                    stream=True, **request_kwargs)
+        _validate_response_peer_chain(resp)
         return _read_bounded_response(resp)
     except (requests.RequestException, ValueError):
         return None

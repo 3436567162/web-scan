@@ -1,3 +1,4 @@
+import os
 import socket
 import unittest
 from unittest.mock import patch
@@ -34,6 +35,31 @@ class LargeStreamResponse:
 
     def close(self):
         self.closed = True
+
+
+class PeerSocket:
+    def __init__(self, peer_ip):
+        self.peer_ip = peer_ip
+
+    def getpeername(self):
+        return (self.peer_ip, 443)
+
+
+class PeerConnection:
+    def __init__(self, peer_ip):
+        self.sock = PeerSocket(peer_ip)
+
+
+class PeerRaw:
+    def __init__(self, peer_ip):
+        self._connection = PeerConnection(peer_ip)
+
+
+class PeerAwareResponse(LargeStreamResponse):
+    def __init__(self, peer_ip, chunks=None, url="https://example.test/peer"):
+        super().__init__(chunks or [b"ok"], url=url)
+        self.raw = PeerRaw(peer_ip)
+        self.history = []
 
 
 class FetchSafetyTests(unittest.TestCase):
@@ -121,6 +147,68 @@ class FetchSafetyTests(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertTrue(response.closed)
+
+    @patch("socket.getaddrinfo")
+    @patch("scanner.crawler.requests.request")
+    def test_fetch_supports_options_method(self, mock_request, mock_getaddrinfo):
+        mock_getaddrinfo.side_effect = self.public_dns
+        mock_request.return_value = make_response(
+            200,
+            headers={"Allow": "GET, POST, OPTIONS"},
+        )
+
+        result = crawler.fetch(
+            "https://example.test/",
+            method="OPTIONS",
+            allow_redirects=False,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual("OPTIONS", mock_request.call_args.args[0])
+        self.assertFalse(mock_request.call_args.kwargs["allow_redirects"])
+
+    @patch("socket.getaddrinfo")
+    @patch("scanner.crawler.requests.get")
+    def test_fetch_verifies_tls_by_default(self, mock_get, mock_getaddrinfo):
+        mock_getaddrinfo.side_effect = self.public_dns
+        mock_get.return_value = make_response(200)
+
+        result = crawler.fetch("https://example.test/")
+
+        self.assertIsNotNone(result)
+        self.assertTrue(mock_get.call_args.kwargs["verify"])
+
+    @patch("socket.getaddrinfo")
+    @patch("scanner.crawler.requests.get")
+    def test_fetch_allows_tls_verification_override(self, mock_get, mock_getaddrinfo):
+        mock_getaddrinfo.side_effect = self.public_dns
+        mock_get.return_value = make_response(200)
+
+        with patch.dict(os.environ, {"SCANNER_VERIFY_TLS": "0"}, clear=False):
+            result = crawler.fetch("https://example.test/")
+
+        self.assertIsNotNone(result)
+        self.assertFalse(mock_get.call_args.kwargs["verify"])
+
+    @patch("socket.getaddrinfo")
+    @patch("scanner.crawler.requests.get")
+    def test_fetch_rejects_blocked_peer_address(self, mock_get, mock_getaddrinfo):
+        mock_getaddrinfo.side_effect = self.public_dns
+        mock_get.return_value = PeerAwareResponse("169.254.169.254")
+
+        result = crawler.fetch("https://example.test/")
+
+        self.assertIsNone(result)
+
+    @patch("socket.getaddrinfo")
+    @patch("scanner.crawler.requests.get")
+    def test_fetch_rejects_unexpected_public_peer_address(self, mock_get, mock_getaddrinfo):
+        mock_getaddrinfo.side_effect = self.public_dns
+        mock_get.return_value = PeerAwareResponse("1.1.1.1")
+
+        result = crawler.fetch("https://example.test/")
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

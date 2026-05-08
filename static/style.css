@@ -93,6 +93,39 @@ header h1 {
     margin-top: 12px;
 }
 
+.module-picker {
+    margin-top: 18px;
+}
+
+.module-picker-label {
+    color: #c5d5e5;
+    font-size: 0.82rem;
+    margin-bottom: 10px;
+}
+
+.module-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+}
+
+.module-option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid #2a3a4a;
+    background: #13202b;
+    color: #ccddee;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.module-option input {
+    accent-color: #00d4ff;
+}
+
 /* Progress */
 .progress {
     margin-bottom: 30px;

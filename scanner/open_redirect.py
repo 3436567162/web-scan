@@ -108,9 +108,9 @@ def check_open_redirect(url):
                 is_external, redirect_target = _is_external_redirect(test_url, location)
                 if is_external:
                     results.append(_build_redirect_finding(
-                        "寮€鏀鹃噸瀹氬悜婕忔礊",
+                        "Open redirect vulnerability",
                         [
-                            f"鍙傛暟 '{param_name}' 瀛樺湪寮€鏀鹃噸瀹氬悜",
+                            f"Parameter '{param_name}' redirects to an external origin.",
                             f"Payload: {payload}",
                             f"Redirect target: {redirect_target}",
                         ],
@@ -135,9 +135,9 @@ def check_open_redirect(url):
             is_external, redirect_target = _is_external_redirect(test_url, location)
             if is_external:
                 results.append(_build_redirect_finding(
-                    "寮€鏀鹃噸瀹氬悜婕忔礊 (璺緞)",
+                    "Open redirect vulnerability (path-based)",
                     [
-                        "璺緞绾ч噸瀹氬悜鍒板閮ㄥ煙",
+                        "Path-based payload redirects to an external origin.",
                         f"Payload: {payload}",
                         f"Redirect target: {redirect_target}",
                     ],
@@ -155,8 +155,8 @@ def check_open_redirect(url):
     if not results:
         results.append({
             "type": "pass",
-            "title": "寮€鏀鹃噸瀹氬悜妫€鏌ラ€氳繃",
-            "detail": "鏈彂鐜板紑鏀鹃噸瀹氬悜婕忔礊",
+            "title": "Open redirect checks passed",
+            "detail": "No cross-origin redirect behavior was confirmed.",
         })
 
     return results

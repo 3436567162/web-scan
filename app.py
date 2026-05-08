@@ -24,6 +24,16 @@ app = Flask(__name__)
 SCAN_REQUEST_LIMIT = 60
 CLIENT_SCAN_COOLDOWN_SECONDS = 5.0
 _LAST_SCAN_BY_CLIENT = {}
+TRUSTED_PROXIES_ENV = "TRUSTED_PROXIES"
+SCAN_MODULE_LABELS = {
+    "info_gather": "Information Gathering",
+    "security_headers": "Security Headers",
+    "sqli": "SQL Injection",
+    "xss": "XSS",
+    "dir_traversal": "Sensitive Paths",
+    "open_redirect": "Open Redirect",
+    "cors": "CORS",
+}
 
 
 def _timestamp_utc():
@@ -56,6 +66,12 @@ def _normalize_optional_list(value):
     if isinstance(value, str):
         return [value]
     return []
+
+
+def _parse_csv_env(value):
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def normalize_findings(module_name, findings):
@@ -130,15 +146,42 @@ def validate_scan_url(url):
     validate_public_http_url(url)
 
 
+def get_trusted_proxies():
+    return set(_parse_csv_env(os.environ.get(TRUSTED_PROXIES_ENV, "")))
+
+
 def get_client_id():
+    remote_addr = request.remote_addr or "unknown"
+    if remote_addr not in get_trusted_proxies():
+        return remote_addr
+
     forwarded_for = request.headers.get("X-Forwarded-For", "")
-    if forwarded_for:
-        return forwarded_for.split(",", 1)[0].strip()
-    return request.remote_addr or "unknown"
+    if not forwarded_for:
+        return remote_addr
+
+    client_ip = forwarded_for.split(",", 1)[0].strip()
+    if client_ip:
+        return client_ip
+    return remote_addr
+
+
+def prune_rate_limit_cache(now=None):
+    if now is None:
+        now = time.monotonic()
+
+    stale_before = now - CLIENT_SCAN_COOLDOWN_SECONDS
+    stale_clients = [
+        client_id
+        for client_id, last_seen in _LAST_SCAN_BY_CLIENT.items()
+        if last_seen <= stale_before
+    ]
+    for client_id in stale_clients:
+        del _LAST_SCAN_BY_CLIENT[client_id]
 
 
 def is_rate_limited(client_id):
     now = time.monotonic()
+    prune_rate_limit_cache(now)
     last_seen = _LAST_SCAN_BY_CLIENT.get(client_id)
     if last_seen is not None and now - last_seen < CLIENT_SCAN_COOLDOWN_SECONDS:
         return True
@@ -169,9 +212,76 @@ SCAN_MODULES = [
 ]
 
 
+def _default_module_label(module_name):
+    return SCAN_MODULE_LABELS.get(module_name, module_name.replace("_", " ").title())
+
+
+def get_scan_module_definitions():
+    definitions = []
+    for entry in SCAN_MODULES:
+        if isinstance(entry, dict):
+            module_name = entry["id"]
+            scan_func = entry["func"]
+            label = entry.get("label") or _default_module_label(module_name)
+        else:
+            module_name = entry[0]
+            scan_func = entry[1]
+            label = entry[2] if len(entry) > 2 else _default_module_label(module_name)
+
+        definitions.append({
+            "id": module_name,
+            "label": label,
+            "func": scan_func,
+        })
+    return definitions
+
+
+def resolve_scan_modules(requested_modules):
+    definitions = get_scan_module_definitions()
+    registry = {definition["id"]: definition for definition in definitions}
+
+    if requested_modules is None:
+        return definitions
+    if not isinstance(requested_modules, list) or not requested_modules:
+        raise ValueError("`modules` must be a non-empty list of module ids")
+
+    selected = []
+    seen = set()
+    unknown = []
+
+    for module_name in requested_modules:
+        if not isinstance(module_name, str):
+            raise ValueError("`modules` must contain only string module ids")
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+
+        definition = registry.get(module_name)
+        if definition is None:
+            unknown.append(module_name)
+            continue
+
+        selected.append(definition)
+
+    if unknown:
+        unknown_text = ", ".join(sorted(unknown))
+        raise ValueError(f"Unknown scan modules: {unknown_text}")
+
+    return selected
+
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        scan_modules=[
+            {
+                "id": definition["id"],
+                "label": definition["label"],
+            }
+            for definition in get_scan_module_definitions()
+        ],
+    )
 
 
 @app.route("/api/scan", methods=["POST"])
@@ -179,13 +289,14 @@ def scan():
     started_monotonic = time.monotonic()
     started_at = _timestamp_utc()
 
-    data = request.get_json()
+    data = request.get_json(silent=True)
     if not data or not data.get("url"):
         return jsonify({"error": "Target URL is required"}), 400
 
     try:
         url = normalize_url(data["url"])
         validate_scan_url(url)
+        selected_modules = resolve_scan_modules(data.get("modules"))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -199,7 +310,9 @@ def scan():
     request_budget_exhausted = False
 
     with request_budget(SCAN_REQUEST_LIMIT):
-        for index, (module_name, scan_func) in enumerate(SCAN_MODULES):
+        for index, definition in enumerate(selected_modules):
+            module_name = definition["id"]
+            scan_func = definition["func"]
             try:
                 module_results = scan_func(url)
                 results[module_name] = normalize_findings(module_name, module_results)
@@ -223,7 +336,9 @@ def scan():
                     ),
                 })
                 results[module_name] = normalize_findings(module_name, results[module_name])
-                modules_skipped = [name for name, _ in SCAN_MODULES[index + 1:]]
+                modules_skipped = [
+                    item["id"] for item in selected_modules[index + 1:]
+                ]
                 break
 
     finished_at = _timestamp_utc()
@@ -241,6 +356,7 @@ def scan():
             "request_budget_exhausted": request_budget_exhausted,
             "modules_run": modules_run,
             "modules_skipped": modules_skipped,
+            "selected_modules": [item["id"] for item in selected_modules],
         },
     })
 

@@ -117,6 +117,95 @@ class AppSecurityTests(unittest.TestCase):
         self.assertEqual(200, first.status_code)
         self.assertEqual(429, second.status_code)
 
+    def test_scan_ignores_forwarded_for_from_untrusted_client(self):
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("93.184.216.34", 80),
+                )
+            ],
+        ), patch.object(
+            app_module,
+            "SCAN_MODULES",
+            [("sentinel", lambda _url: [])],
+        ), patch(
+            "app.time.monotonic",
+            side_effect=[99.0, 100.0, 101.0, 102.0, 103.0, 104.0],
+        ):
+            first = self.client.post(
+                "/api/scan",
+                json={"url": "example.com"},
+                headers={"X-Forwarded-For": "198.51.100.1"},
+                environ_overrides={"REMOTE_ADDR": "203.0.113.9"},
+            )
+            second = self.client.post(
+                "/api/scan",
+                json={"url": "example.com"},
+                headers={"X-Forwarded-For": "198.51.100.2"},
+                environ_overrides={"REMOTE_ADDR": "203.0.113.9"},
+            )
+
+        self.assertEqual(200, first.status_code)
+        self.assertEqual(429, second.status_code)
+
+    def test_scan_uses_forwarded_for_from_trusted_proxy(self):
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("93.184.216.34", 80),
+                )
+            ],
+        ), patch.object(
+            app_module,
+            "SCAN_MODULES",
+            [("sentinel", lambda _url: [])],
+        ), patch.dict(
+            os.environ,
+            {"TRUSTED_PROXIES": "203.0.113.9"},
+            clear=False,
+        ), patch(
+            "app.time.monotonic",
+            side_effect=[99.0, 100.0, 101.0, 102.0, 103.0, 104.0],
+        ):
+            first = self.client.post(
+                "/api/scan",
+                json={"url": "example.com"},
+                headers={"X-Forwarded-For": "198.51.100.1"},
+                environ_overrides={"REMOTE_ADDR": "203.0.113.9"},
+            )
+            second = self.client.post(
+                "/api/scan",
+                json={"url": "example.com"},
+                headers={"X-Forwarded-For": "198.51.100.2"},
+                environ_overrides={"REMOTE_ADDR": "203.0.113.9"},
+            )
+
+        self.assertEqual(200, first.status_code)
+        self.assertEqual(200, second.status_code)
+
+    def test_rate_limit_cache_prunes_stale_clients(self):
+        app_module._LAST_SCAN_BY_CLIENT.update({
+            "stale-client": 90.0,
+            "active-client": 100.0,
+        })
+
+        with patch("app.time.monotonic", return_value=103.0):
+            self.assertFalse(app_module.is_rate_limited("new-client"))
+
+        self.assertNotIn("stale-client", app_module._LAST_SCAN_BY_CLIENT)
+        self.assertEqual(100.0, app_module._LAST_SCAN_BY_CLIENT["active-client"])
+        self.assertEqual(103.0, app_module._LAST_SCAN_BY_CLIENT["new-client"])
+
     def test_normalize_url_rejects_blank_and_non_http_schemes(self):
         invalid_urls = ["", "   ", "ftp://example.com", "javascript:alert(1)"]
 

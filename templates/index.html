@@ -18,6 +18,17 @@
                 <input type="text" id="targetUrl" placeholder="Enter a target URL, for example: http://example.com" />
                 <button id="scanBtn" onclick="startScan()">Start Scan</button>
             </div>
+            <div class="module-picker">
+                <p class="module-picker-label">Scan modules</p>
+                <div class="module-grid">
+                    {% for module in scan_modules %}
+                    <label class="module-option">
+                        <input type="checkbox" name="scanModule" value="{{ module.id }}" checked />
+                        <span>{{ module.label }}</span>
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
             <p class="disclaimer">Use only for authorized security testing.</p>
         </div>
 
@@ -57,15 +68,29 @@
     </div>
 
     <script>
-        const SCAN_MODULES = [
-            "Information Gathering", "Security Headers", "SQL Injection",
-            "XSS", "Sensitive Paths", "Open Redirect", "CORS"
-        ];
+        const SCAN_MODULES = {{ scan_modules|tojson }};
+        const SCAN_MODULE_LABELS = Object.fromEntries(
+            SCAN_MODULES.map(module => [module.id, module.label])
+        );
+
+        function getSelectedModules() {
+            return Array.from(document.querySelectorAll('input[name="scanModule"]:checked'))
+                .map(input => input.value);
+        }
+
+        function getModuleLabel(moduleId) {
+            return SCAN_MODULE_LABELS[moduleId] || moduleId;
+        }
 
         async function startScan() {
             const url = document.getElementById("targetUrl").value.trim();
             if (!url) {
                 alert("Please enter a target URL.");
+                return;
+            }
+            const selectedModules = getSelectedModules();
+            if (selectedModules.length === 0) {
+                alert("Select at least one scan module.");
                 return;
             }
 
@@ -81,18 +106,22 @@
             let progress = 0;
             const progressFill = document.getElementById("progressFill");
             const progressText = document.getElementById("progressText");
+            const progressModules = selectedModules.map(getModuleLabel);
             const interval = setInterval(() => {
                 progress = Math.min(progress + Math.random() * 8, 90);
                 progressFill.style.width = progress + "%";
-                const moduleIdx = Math.min(Math.floor(progress / 13), SCAN_MODULES.length - 1);
-                progressText.textContent = `Scanning: ${SCAN_MODULES[moduleIdx]}...`;
+                const moduleIdx = Math.min(
+                    Math.floor((progress / 100) * progressModules.length),
+                    progressModules.length - 1
+                );
+                progressText.textContent = `Scanning: ${progressModules[moduleIdx]}...`;
             }, 300);
 
             try {
                 const resp = await fetch("/api/scan", {
                     method: "POST",
                     headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({url: url}),
+                    body: JSON.stringify({url: url, modules: selectedModules}),
                 });
                 const data = await resp.json();
 
@@ -152,12 +181,12 @@
                 header.className = "section-header";
                 header.onclick = () => section.classList.toggle("collapsed");
 
-                const vulnCount = items.filter(i => ["high", "medium", "low"].includes(i.type)).length;
+                const vulnCount = items.filter(i => ["high", "medium", "low"].includes(i.severity || i.type)).length;
                 const badge = vulnCount > 0
                     ? `<span class="badge badge-warn">${vulnCount} issues</span>`
                     : `<span class="badge badge-ok">Pass</span>`;
 
-                header.innerHTML = `<h3>${escapeHtml(module)}</h3>${badge}`;
+                header.innerHTML = `<h3>${escapeHtml(getModuleLabel(module))}</h3>${badge}`;
                 section.appendChild(header);
 
                 const body = document.createElement("div");
@@ -280,11 +309,17 @@
             if (Array.isArray(scanMetadata.modules_run)) {
                 parts.push(`Modules: ${scanMetadata.modules_run.length}`);
             }
+            if (Array.isArray(scanMetadata.selected_modules) && scanMetadata.selected_modules.length > 0) {
+                parts.push(`Selected: ${scanMetadata.selected_modules.map(getModuleLabel).join(", ")}`);
+            }
             if (scanMetadata.request_budget_limit !== undefined && scanMetadata.request_budget_limit !== null) {
                 parts.push(`Budget: ${scanMetadata.request_budget_limit}`);
             }
             if (scanMetadata.request_budget_exhausted === true) {
                 parts.push("Budget exhausted");
+            }
+            if (Array.isArray(scanMetadata.modules_skipped) && scanMetadata.modules_skipped.length > 0) {
+                parts.push(`Skipped: ${scanMetadata.modules_skipped.map(getModuleLabel).join(", ")}`);
             }
 
             return parts.join(" | ");

@@ -1,77 +1,88 @@
 """Information gathering: server fingerprint, tech stack, CMS detection."""
 
 from urllib.parse import urlparse
+
 from .crawler import fetch
+
+
+ADMIN_PATHS = ["/admin", "/administrator", "/wp-admin", "/phpmyadmin", "/manager"]
+DANGEROUS_HTTP_METHODS = ["PUT", "DELETE", "TRACE", "CONNECT"]
 
 
 def gather_info(url):
     """Gather basic information about the target."""
     results = []
-    resp = fetch(url)
-    if resp is None:
-        return [{"type": "info", "title": "连接失败", "detail": f"无法访问目标 {url}"}]
+    response = fetch(url)
+    if response is None:
+        return [{
+            "type": "info",
+            "title": "Connection failed",
+            "detail": f"Could not reach target: {url}",
+        }]
 
-    headers = resp.headers
-    server = headers.get("Server", "未知")
-    powered_by = headers.get("X-Powered-By", "未知")
-    status = resp.status_code
+    headers = response.headers
+    server = headers.get("Server", "Unknown")
+    powered_by = headers.get("X-Powered-By", "Unknown")
+    status = response.status_code
 
     results.append({
         "type": "info",
-        "title": "服务器信息",
-        "detail": f"服务器: {server} | X-Powered-By: {powered_by} | 状态码: {status}"
+        "title": "Server fingerprint",
+        "detail": f"Server: {server} | X-Powered-By: {powered_by} | Status code: {status}",
     })
 
-    # Detect tech stack from headers and body
-    tech = _detect_tech(headers, resp.text)
+    tech = _detect_tech(headers, response.text)
     if tech:
         results.append({
             "type": "info",
-            "title": "技术栈识别",
-            "detail": ", ".join(tech)
+            "title": "Technology stack detected",
+            "detail": ", ".join(tech),
         })
 
-    # Detect CMS
-    cms = _detect_cms(url, resp.text, headers)
+    cms = _detect_cms(response.text, headers)
     if cms:
         results.append({
             "type": "info",
-            "title": "CMS识别",
-            "detail": cms
+            "title": "CMS detected",
+            "detail": cms,
         })
 
-    # Detect HTTP methods
-    try:
-        import requests as req
-        opt = req.options(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, verify=False)
-        allow = opt.headers.get("Allow", "")
-        if allow:
-            results.append({
-                "type": "info",
-                "title": "允许的HTTP方法",
-                "detail": allow
-            })
-            dangerous = [m for m in ["PUT", "DELETE", "TRACE", "CONNECT"] if m in allow.upper()]
-            if dangerous:
-                results.append({
-                    "type": "low",
-                    "title": "危险HTTP方法启用",
-                    "detail": f"服务器启用了可能危险的方法: {', '.join(dangerous)}"
-                })
-    except Exception:
-        pass
+    options_response = fetch(url, method="OPTIONS", allow_redirects=False)
+    allow = options_response.headers.get("Allow", "") if options_response is not None else ""
+    if allow:
+        results.append({
+            "type": "info",
+            "title": "Allowed HTTP methods",
+            "detail": allow,
+        })
 
-    # Detect admin paths
-    parsed = urlparse(url)
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    admin_paths = ["/admin", "/administrator", "/wp-admin", "/phpmyadmin", "/manager"]
-    for path in admin_paths:
-        resp_admin = fetch(base + path)
-        if resp_admin is not None and resp_admin.status_code == 200 and len(resp_admin.text) > 100:
+        dangerous_methods = [
+            method for method in DANGEROUS_HTTP_METHODS if method in allow.upper()
+        ]
+        if dangerous_methods:
             results.append({
                 "type": "low",
-                "title": "管理后台路径",
-                "detail": f"发现管理路径: {base + path} (状态码: {resp_admin.status_code})"
+                "title": "Dangerous HTTP methods enabled",
+                "detail": (
+                    "Server allows potentially dangerous methods: "
+                    + ", ".join(dangerous_methods)
+                ),
+            })
+
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    for path in ADMIN_PATHS:
+        admin_response = fetch(base + path)
+        if admin_response is None:
+            continue
+        if admin_response.status_code == 200 and len(admin_response.text) > 100:
+            results.append({
+                "type": "low",
+                "title": "Administrative path exposed",
+                "detail": (
+                    f"Discovered likely administrative path: {base + path} "
+                    f"(status code: {admin_response.status_code})"
+                ),
             })
             break
 
@@ -83,6 +94,7 @@ def _detect_tech(headers, body):
     tech = []
     powered = headers.get("X-Powered-By", "").lower()
     server = headers.get("Server", "").lower()
+    cookie_header = headers.get("Set-Cookie", "")
 
     if "php" in powered or "php" in server:
         tech.append("PHP")
@@ -94,9 +106,9 @@ def _detect_tech(headers, body):
         tech.append("Django")
     if "flask" in body.lower():
         tech.append("Flask")
-    if "laravel" in body.lower() or "laravel_session" in headers.get("Set-Cookie", ""):
+    if "laravel" in body.lower() or "laravel_session" in cookie_header:
         tech.append("Laravel")
-    if "spring" in powered.lower() or "jsessionid" in headers.get("Set-Cookie", "").lower():
+    if "spring" in powered or "jsessionid" in cookie_header.lower():
         tech.append("Java/Spring")
     if "nginx" in server:
         tech.append("Nginx")
@@ -108,7 +120,7 @@ def _detect_tech(headers, body):
     return tech
 
 
-def _detect_cms(url, body, headers):
+def _detect_cms(body, headers):
     """Detect common CMS platforms."""
     body_lower = body.lower()
     cookies = headers.get("Set-Cookie", "").lower()
